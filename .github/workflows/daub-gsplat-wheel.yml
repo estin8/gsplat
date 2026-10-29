@@ -62,11 +62,21 @@ jobs:
           pip install "setuptools<82" wheel ninja numpy
           pip install torch==${{ env.TORCH_VERSION }} --index-url https://download.pytorch.org/whl/${{ env.CUDA_TAG }}
           python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
-          # Keep compiling after a file fails, so one run reports every broken file instead of only the first.
-          ce=$(python -c "import torch.utils.cpp_extension as c; print(c.__file__)")
-          sed -i "s/command = \['ninja', '-v'\]/command = ['ninja', '-v', '-k', '0']/" "$ce"
-          grep -q "'-k', '0'" "$ce" && echo "keep-going on" || echo "::warning::could not enable keep-going; build stops at the first error"
         shell: bash
+
+      - name: Keep compiling after errors (report every broken file in one run)
+        # PyTorch's build helper runs "ninja -v"; adding "-k 0" makes ninja finish every file it can.
+        run: |
+          import pathlib, torch.utils.cpp_extension as ce
+          p = pathlib.Path(ce.__file__)
+          s = p.read_text(encoding="utf-8")
+          old = "command = ['ninja', '-v']"
+          if old in s:
+              p.write_text(s.replace(old, "command = ['ninja', '-v', '-k', '0']"), encoding="utf-8")
+              print("keep-going on")
+          else:
+              print("::warning::could not enable keep-going; the build stops at the first error")
+        shell: python
 
       - name: Patch a Windows-only compile error
         # Cameras.cuh calls std::isfinite in GPU code. Linux compilers accept that; Windows' (MSVC) doesn't,
