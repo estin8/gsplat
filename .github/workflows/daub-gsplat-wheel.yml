@@ -2,6 +2,7 @@
 #
 # Goes in your GitHub copy of gsplat at:  .github/workflows/daub-gsplat-wheel.yml
 # Run it from the repo's Actions tab ("Daub gsplat wheel" -> Run workflow). It takes about 1-2 hours.
+# Tick "Quick check" to compile for RTX 50 only, which finds compile errors several times faster.
 # The finished wheel appears under the run's "Artifacts" as daub-gsplat-wheel.zip.
 #
 # Based on gsplat's own Windows build (.github/workflows/building.yml), with four changes:
@@ -12,7 +13,13 @@
 
 name: Daub gsplat wheel
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      quick:
+        description: "Quick check: compile for RTX 50 only, to find compile errors fast (not for release)"
+        type: boolean
+        default: false
 
 jobs:
   windows-wheel:
@@ -24,7 +31,7 @@ jobs:
       CUDA_TAG: cu128
       CUDA_HOME: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
       # RTX 20 = 7.5, RTX 30 = 8.0/8.6, RTX 40 = 8.9, RTX 50 = 12.0
-      TORCH_CUDA_ARCH_LIST: "7.5;8.0;8.6;8.9;12.0+PTX"
+      TORCH_CUDA_ARCH_LIST: ${{ inputs.quick && '12.0' || '7.5;8.0;8.6;8.9;12.0+PTX' }}
       MAX_JOBS: "4"
 
     steps:
@@ -43,12 +50,22 @@ jobs:
         run: bash .github/workflows/cuda/Windows.sh ${{ env.CUDA_TAG }}
         shell: bash
 
+      - name: Reuse downloaded packages from earlier runs
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: pip-${{ env.TORCH_VERSION }}-${{ env.CUDA_TAG }}-v1
+
       - name: Install PyTorch ${{ env.TORCH_VERSION }}+${{ env.CUDA_TAG }}
         run: |
           python -m pip install --upgrade pip
           pip install "setuptools<82" wheel ninja numpy
           pip install torch==${{ env.TORCH_VERSION }} --index-url https://download.pytorch.org/whl/${{ env.CUDA_TAG }}
           python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+          # Keep compiling after a file fails, so one run reports every broken file instead of only the first.
+          ce=$(python -c "import torch.utils.cpp_extension as c; print(c.__file__)")
+          sed -i "s/command = \['ninja', '-v'\]/command = ['ninja', '-v', '-k', '0']/" "$ce"
+          grep -q "'-k', '0'" "$ce" && echo "keep-going on" || echo "::warning::could not enable keep-going; build stops at the first error"
         shell: bash
 
       - name: Patch a Windows-only compile error
@@ -56,11 +73,25 @@ jobs:
         # because its isfinite is a CPU-only template. Replace it with the same test in plain arithmetic:
         # |x| <= FLT_MAX is false exactly when x is infinite or NaN.
         run: |
-          f=gsplat/cuda/include/Cameras.cuh
-          sed -i 's/std::isfinite(point\.x)/(fabsf(point.x) <= 3.402823466e+38f)/; s/std::isfinite(point\.y)/(fabsf(point.y) <= 3.402823466e+38f)/' "$f"
-          if grep -rn "std::isfinite" gsplat/cuda; then echo "::error::std::isfinite still present - patch did not apply"; exit 1; fi
-          grep -n "fabsf(point" "$f"
-        shell: bash
+          import pathlib, sys
+          f = pathlib.Path("gsplat/cuda/include/Cameras.cuh")
+          s = f.read_text(encoding="utf-8")
+          n = 0
+          for v in ("point.x", "point.y"):
+              old, new = f"std::isfinite({v})", f"(fabsf({v}) <= 3.402823466e+38f)"
+              n += s.count(old)
+              s = s.replace(old, new)
+          f.write_text(s, encoding="utf-8")
+          print(f"replaced {n} call(s)")
+          # Check only gsplat's own camera code. (A bundled math library, third_party/glm, also uses
+          # std::isfinite, but only in CPU code, which compiles fine on Windows.)
+          left = [f"{f}:{i}: {l.strip()}" for i, l in enumerate(s.splitlines(), 1) if "std::isfinite" in l]
+          for l in left:
+              print(f"::error::still present: {l[:300]}")
+          if n != 2 or left:
+              print(f"::error::patch expected 2 replacements, made {n}")
+              sys.exit(1)
+        shell: python
 
       - name: Label the version (1.6.0+pt210cu128)
         run: |
@@ -92,6 +123,6 @@ jobs:
       - name: Save the wheel
         uses: actions/upload-artifact@v4
         with:
-          name: daub-gsplat-wheel
+          name: ${{ inputs.quick && 'quick-check-only-not-for-release' || 'daub-gsplat-wheel' }}
           path: dist/*.whl
           retention-days: 30
