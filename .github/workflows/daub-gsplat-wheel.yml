@@ -4,10 +4,11 @@
 # Run it from the repo's Actions tab ("Daub gsplat wheel" -> Run workflow). It takes about 1-2 hours.
 # The finished wheel appears under the run's "Artifacts" as daub-gsplat-wheel.zip.
 #
-# Based on gsplat's own Windows build (.github/workflows/building.yml), with three changes:
+# Based on gsplat's own Windows build (.github/workflows/building.yml), with four changes:
 #   - only the one combination Daub uses: Windows, Python 3.10, PyTorch 2.10.0, CUDA 12.8
 #   - GPU list extended to RTX 40 (8.9) and RTX 50 (12.0), plus portable code for future cards (+PTX)
 #   - always builds the same, tested gsplat code (a fixed commit), not whatever is newest
+#   - one-line fix for a Windows-only compile error in that commit (see "Patch" step)
 
 name: Daub gsplat wheel
 
@@ -50,6 +51,17 @@ jobs:
           python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
         shell: bash
 
+      - name: Patch a Windows-only compile error
+        # Cameras.cuh calls std::isfinite in GPU code. Linux compilers accept that; Windows' (MSVC) doesn't,
+        # because its isfinite is a CPU-only template. Replace it with the same test in plain arithmetic:
+        # |x| <= FLT_MAX is false exactly when x is infinite or NaN.
+        run: |
+          f=gsplat/cuda/include/Cameras.cuh
+          sed -i 's/std::isfinite(point\.x)/(fabsf(point.x) <= 3.402823466e+38f)/; s/std::isfinite(point\.y)/(fabsf(point.y) <= 3.402823466e+38f)/' "$f"
+          if grep -rn "std::isfinite" gsplat/cuda; then echo "::error::std::isfinite still present - patch did not apply"; exit 1; fi
+          grep -n "fabsf(point" "$f"
+        shell: bash
+
       - name: Label the version (1.6.0+pt210cu128)
         run: |
           VERSION=`sed -n 's/^__version__ = "\(.*\)"/\1/p' gsplat/version.py`
@@ -59,8 +71,15 @@ jobs:
 
       - name: Build the wheel
         run: |
+          set -o pipefail
           export PATH="${CUDA_HOME}/bin:${PATH}"
-          python setup.py bdist_wheel --dist-dir=dist
+          if ! python setup.py bdist_wheel --dist-dir=dist 2>&1 | tee build.log; then
+            # Put the compiler's error lines in the run summary, so they can be read without the full log.
+            grep -E " error[: ]|error:|fatal error" build.log | grep -v Werror | head -20 | while IFS= read -r line; do
+              echo "::error::${line:0:900}"
+            done
+            exit 1
+          fi
         shell: bash
 
       - name: Check it installs and imports
