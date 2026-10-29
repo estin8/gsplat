@@ -33,9 +33,10 @@ jobs:
       # RTX 20 = 7.5, RTX 30 and RTX 40 = 8.6 (RTX 40 runs 8.6 code natively), RTX 50 = 12.0.
       # +PTX adds portable code that newer, future cards can compile on first use.
       TORCH_CUDA_ARCH_LIST: ${{ inputs.quick && '12.0' || '7.5;8.6;12.0+PTX' }}
-      MAX_JOBS: "3"
-      # Compile the GPU generations side by side inside each file (the biggest files dominate the build).
-      NVCC_APPEND_FLAGS: "--threads 3"
+      # At most 4 compiler processes at once (2 files x 2 GPU generations each). The machine has 4 cores
+      # and 16 GB; 3 x 3 = 9 at once ran out of memory on the biggest files.
+      MAX_JOBS: "2"
+      NVCC_APPEND_FLAGS: "--threads 2"
 
     steps:
       - name: Get gsplat at the fixed commit
