@@ -7,7 +7,8 @@
 #
 # Based on gsplat's own Windows build (.github/workflows/building.yml), with four changes:
 #   - only the one combination Daub uses: Windows, Python 3.10, PyTorch 2.10.0, CUDA 12.8
-#   - GPU list: RTX 20 (7.5), RTX 30/40 (8.6), RTX 50 (12.0), plus portable code for future cards (+PTX)
+#   - GPU list: RTX 20 (7.5), RTX 30/40 (8.6), RTX 50 (12.0)
+#   - extra overflow memory (pagefile) and capped parallel compiles, so big files can't run out of memory
 #   - always builds the same, tested gsplat code (a fixed commit), not whatever is newest
 #   - small fixes for Windows-only compile errors in that commit (see "Patch" step)
 
@@ -21,6 +22,10 @@ on:
         type: boolean
         default: false
 
+# The build only needs to read the code; it can't change anything else in the repo.
+permissions:
+  contents: read
+
 jobs:
   windows-wheel:
     runs-on: windows-2022
@@ -31,14 +36,24 @@ jobs:
       CUDA_TAG: cu128
       CUDA_HOME: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
       # RTX 20 = 7.5, RTX 30 and RTX 40 = 8.6 (RTX 40 runs 8.6 code natively), RTX 50 = 12.0.
-      # +PTX adds portable code that newer, future cards can compile on first use.
-      TORCH_CUDA_ARCH_LIST: ${{ inputs.quick && '12.0' || '7.5;8.6;12.0+PTX' }}
+      # No +PTX (portable code for future cards): a whole extra compile per file, and a future card
+      # generation would need a new build anyway.
+      TORCH_CUDA_ARCH_LIST: ${{ inputs.quick && '12.0' || '7.5;8.6;12.0' }}
       # At most 4 compiler processes at once (2 files x 2 GPU generations each). The machine has 4 cores
       # and 16 GB; 3 x 3 = 9 at once ran out of memory on the biggest files.
       MAX_JOBS: "2"
       NVCC_APPEND_FLAGS: "--threads 2"
 
     steps:
+      - name: Add overflow memory (pagefile) so big files can't run out of memory
+        # al-cheb/configure-pagefile-action (MIT), locked to one reviewed version. Runs only on this
+        # throwaway build machine; nothing from it ends up in the wheel.
+        uses: al-cheb/configure-pagefile-action@b158448acc98bbaeed7513afc5c84229405b33ad
+        with:
+          minimum-size: 16GB
+          maximum-size: 32GB
+          disk-root: "D:"
+
       - name: Get gsplat at the fixed commit
         uses: actions/checkout@v4
         with:
