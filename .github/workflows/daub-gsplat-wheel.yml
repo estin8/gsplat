@@ -1,4 +1,4 @@
-# Daub: build one gsplat wheel for Windows that runs on RTX 20, 30, 40 and 50 series cards.
+# Daub: build one gsplat wheel for Windows that runs on RTX 30, 40 and 50 series cards.
 #
 # Goes in your GitHub copy of gsplat at:  .github/workflows/daub-gsplat-wheel.yml
 # Run it from the repo's Actions tab ("Daub gsplat wheel" -> Run workflow). A full build takes a few hours.
@@ -7,7 +7,7 @@
 #
 # Based on gsplat's own Windows build (.github/workflows/building.yml), with four changes:
 #   - only the one combination Daub uses: Windows, Python 3.10, PyTorch 2.10.0, CUDA 12.8
-#   - GPU list: RTX 20 (7.5), RTX 30/40 (8.6), RTX 50 (12.0)
+#   - GPU list: RTX 30/40 (8.6), RTX 50 (12.0)
 #   - extra overflow memory (pagefile) and capped parallel compiles, so big files can't run out of memory
 #   - always builds the same, tested gsplat code (a fixed commit), not whatever is newest
 #   - small fixes for Windows-only compile errors in that commit (see "Patch" step)
@@ -35,10 +35,11 @@ jobs:
       TORCH_VERSION: "2.10.0"
       CUDA_TAG: cu128
       CUDA_HOME: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
-      # RTX 20 = 7.5, RTX 30 and RTX 40 = 8.6 (RTX 40 runs 8.6 code natively), RTX 50 = 12.0.
+      # RTX 30 and RTX 40 = 8.6 (RTX 40 runs 8.6 code natively), RTX 50 = 12.0. RTX 20 (7.5) dropped to
+      # keep the build well inside GitHub's time limit; add 7.5 back to support RTX 20 cards.
       # No +PTX (portable code for future cards): a whole extra compile per file, and a future card
       # generation would need a new build anyway.
-      TORCH_CUDA_ARCH_LIST: ${{ inputs.quick && '12.0' || '7.5;8.6;12.0' }}
+      TORCH_CUDA_ARCH_LIST: ${{ inputs.quick && '12.0' || '8.6;12.0' }}
       # At most 4 compiler processes at once (2 files x 2 GPU generations each). The machine has 4 cores
       # and 16 GB; 3 x 3 = 9 at once ran out of memory on the biggest files.
       MAX_JOBS: "2"
@@ -98,13 +99,17 @@ jobs:
         shell: python
 
       - name: Patch Windows-only compile errors
-        # gsplat is only tested on Linux; Windows' compiler (MSVC) rejects two spots in this commit.
+        # gsplat is only tested on Linux; Windows (MSVC) rejects five spots in this commit.
         # 1. Cameras.cuh calls std::isfinite in GPU code; MSVC's isfinite is CPU-only. Same test in plain
         #    arithmetic: |x| <= FLT_MAX is false exactly when x is infinite or NaN.
         # 2. SphericalHarmonicsL1PlusCUDA.cu makes a size-0 std::array when the SH degree is 0; MSVC's
         #    size-0 array has a CPU-only operator[]. Give it at least 1 slot (never read; loops stop at MAX_K).
         # 3. RasterizeToPixelsFromWorld3DGSParallelBatchBwd.cu uses __builtin_clzll (GCC/Clang only) in CPU code.
         #    Replace with a plain loop that counts the bits of x-1, which is the same number.
+        # 4. Link: at::cuda::cub::radix_sort_pairs isn't exported from PyTorch's Windows DLL. Call CUB's
+        #    DeviceRadixSort::SortPairs directly instead (same sort, same stream), as IntersectTile.cu does.
+        # 5. Link: the ParallelBatch fwd launcher is declared with "bool fwd_only" but defined with
+        #    "const bool fwd_only"; MSVC gives those different names. Make the definition match.
         run: |
           import pathlib, sys
           patches = [
@@ -117,6 +122,15 @@ jobs:
               ("gsplat/cuda/csrc/RasterizeToPixelsFromWorld3DGSParallelBatchBwd.cu",
                "return 64u - static_cast<uint32_t>(__builtin_clzll(x - 1));",
                "uint64_t v = x - 1; uint32_t bits = 0; while(v) { ++bits; v >>= 1; } return bits;", 1),
+              ('gsplat/cuda/csrc/RasterizeToPixelsFromWorld3DGSParallelBatchBwd.cu',
+               '#    include <ATen/cuda/cub.h>\n',
+               '#    include <ATen/cuda/cub.h>\n#    include <c10/cuda/CUDACachingAllocator.h>\n#    include <cub/cub.cuh>\n', 1),
+              ('gsplat/cuda/csrc/RasterizeToPixelsFromWorld3DGSParallelBatchBwd.cu',
+               '    at::cuda::cub::radix_sort_pairs<int64_t, int32_t>(\n        sort_keys.const_data_ptr<int64_t>(),\n        sorted_keys.data_ptr<int64_t>(),\n        sort_values.const_data_ptr<int32_t>(),\n        bid_to_slot.data_ptr<int32_t>(),\n        total_batches,\n        /*descending=*/false,\n        /*begin_bit=*/0,\n        /*end_bit=*/static_cast<int64_t>(total_bits == 0 ? 1u : total_bits)\n    );',
+               '    CUB_WRAPPER(\n        cub::DeviceRadixSort::SortPairs,\n        sort_keys.const_data_ptr<int64_t>(),\n        sorted_keys.data_ptr<int64_t>(),\n        sort_values.const_data_ptr<int32_t>(),\n        bid_to_slot.data_ptr<int32_t>(),\n        static_cast<int>(total_batches),\n        0,\n        static_cast<int>(total_bits == 0 ? 1u : total_bits),\n        at::cuda::getCurrentCUDAStream()\n    );', 1),
+              ('gsplat/cuda/csrc/RasterizeToPixelsFromWorld3DGSParallelBatchFwd.cu',
+               '    const bool fwd_only,',
+               '    bool fwd_only,', 1),
           ]
           ok = True
           for path, old, new, want in patches:
