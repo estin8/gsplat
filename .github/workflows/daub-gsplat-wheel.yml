@@ -1,15 +1,15 @@
 # Daub: build one gsplat wheel for Windows that runs on RTX 20, 30, 40 and 50 series cards.
 #
 # Goes in your GitHub copy of gsplat at:  .github/workflows/daub-gsplat-wheel.yml
-# Run it from the repo's Actions tab ("Daub gsplat wheel" -> Run workflow). It takes about 1-2 hours.
+# Run it from the repo's Actions tab ("Daub gsplat wheel" -> Run workflow). A full build takes a few hours.
 # Tick "Quick check" to compile for RTX 50 only, which finds compile errors several times faster.
 # The finished wheel appears under the run's "Artifacts" as daub-gsplat-wheel.zip.
 #
 # Based on gsplat's own Windows build (.github/workflows/building.yml), with four changes:
 #   - only the one combination Daub uses: Windows, Python 3.10, PyTorch 2.10.0, CUDA 12.8
-#   - GPU list extended to RTX 40 (8.9) and RTX 50 (12.0), plus portable code for future cards (+PTX)
+#   - GPU list: RTX 20 (7.5), RTX 30/40 (8.6), RTX 50 (12.0), plus portable code for future cards (+PTX)
 #   - always builds the same, tested gsplat code (a fixed commit), not whatever is newest
-#   - one-line fix for a Windows-only compile error in that commit (see "Patch" step)
+#   - small fixes for Windows-only compile errors in that commit (see "Patch" step)
 
 name: Daub gsplat wheel
 
@@ -24,15 +24,18 @@ on:
 jobs:
   windows-wheel:
     runs-on: windows-2022
-    timeout-minutes: 300
+    timeout-minutes: 350
     env:
       GSPLAT_COMMIT: 512d366b67073d77ca099ede742683c165dfc23b
       TORCH_VERSION: "2.10.0"
       CUDA_TAG: cu128
       CUDA_HOME: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
-      # RTX 20 = 7.5, RTX 30 = 8.0/8.6, RTX 40 = 8.9, RTX 50 = 12.0
-      TORCH_CUDA_ARCH_LIST: ${{ inputs.quick && '12.0' || '7.5;8.0;8.6;8.9;12.0+PTX' }}
-      MAX_JOBS: "4"
+      # RTX 20 = 7.5, RTX 30 and RTX 40 = 8.6 (RTX 40 runs 8.6 code natively), RTX 50 = 12.0.
+      # +PTX adds portable code that newer, future cards can compile on first use.
+      TORCH_CUDA_ARCH_LIST: ${{ inputs.quick && '12.0' || '7.5;8.6;12.0+PTX' }}
+      MAX_JOBS: "3"
+      # Compile the GPU generations side by side inside each file (the biggest files dominate the build).
+      NVCC_APPEND_FLAGS: "--threads 3"
 
     steps:
       - name: Get gsplat at the fixed commit
@@ -78,29 +81,41 @@ jobs:
               print("::warning::could not enable keep-going; the build stops at the first error")
         shell: python
 
-      - name: Patch a Windows-only compile error
-        # Cameras.cuh calls std::isfinite in GPU code. Linux compilers accept that; Windows' (MSVC) doesn't,
-        # because its isfinite is a CPU-only template. Replace it with the same test in plain arithmetic:
-        # |x| <= FLT_MAX is false exactly when x is infinite or NaN.
+      - name: Patch Windows-only compile errors
+        # gsplat is only tested on Linux; Windows' compiler (MSVC) rejects two spots in this commit.
+        # 1. Cameras.cuh calls std::isfinite in GPU code; MSVC's isfinite is CPU-only. Same test in plain
+        #    arithmetic: |x| <= FLT_MAX is false exactly when x is infinite or NaN.
+        # 2. SphericalHarmonicsL1PlusCUDA.cu makes a size-0 std::array when the SH degree is 0; MSVC's
+        #    size-0 array has a CPU-only operator[]. Give it at least 1 slot (never read; loops stop at MAX_K).
+        # 3. RasterizeToPixelsFromWorld3DGSParallelBatchBwd.cu uses __builtin_clzll (GCC/Clang only) in CPU code.
+        #    Replace with a plain loop that counts the bits of x-1, which is the same number.
         run: |
           import pathlib, sys
-          f = pathlib.Path("gsplat/cuda/include/Cameras.cuh")
-          s = f.read_text(encoding="utf-8")
-          n = 0
-          for v in ("point.x", "point.y"):
-              old, new = f"std::isfinite({v})", f"(fabsf({v}) <= 3.402823466e+38f)"
-              n += s.count(old)
-              s = s.replace(old, new)
-          f.write_text(s, encoding="utf-8")
-          print(f"replaced {n} call(s)")
-          # Check only gsplat's own camera code. (A bundled math library, third_party/glm, also uses
-          # std::isfinite, but only in CPU code, which compiles fine on Windows.)
-          left = [f"{f}:{i}: {l.strip()}" for i, l in enumerate(s.splitlines(), 1) if "std::isfinite" in l]
-          for l in left:
-              print(f"::error::still present: {l[:300]}")
-          if n != 2 or left:
-              print(f"::error::patch expected 2 replacements, made {n}")
-              sys.exit(1)
+          patches = [
+              ("gsplat/cuda/include/Cameras.cuh",
+               "std::isfinite(point.x)", "(fabsf(point.x) <= 3.402823466e+38f)", 1),
+              ("gsplat/cuda/include/Cameras.cuh",
+               "std::isfinite(point.y)", "(fabsf(point.y) <= 3.402823466e+38f)", 1),
+              ("gsplat/cuda/csrc/SphericalHarmonicsL1PlusCUDA.cu",
+               "std::array<opmath_t, MAX_K> acc{};", "std::array<opmath_t, (MAX_K > 0 ? MAX_K : 1)> acc{};", 1),
+              ("gsplat/cuda/csrc/RasterizeToPixelsFromWorld3DGSParallelBatchBwd.cu",
+               "return 64u - static_cast<uint32_t>(__builtin_clzll(x - 1));",
+               "uint64_t v = x - 1; uint32_t bits = 0; while(v) { ++bits; v >>= 1; } return bits;", 1),
+          ]
+          ok = True
+          for path, old, new, want in patches:
+              f = pathlib.Path(path)
+              s = f.read_text(encoding="utf-8")
+              n = s.count(old)
+              f.write_text(s.replace(old, new), encoding="utf-8")
+              print(f"{path}: replaced {n} (expected {want})")
+              if n != want:
+                  print(f"::error::patch did not match in {path}: {old}")
+                  ok = False
+          if "std::isfinite" in pathlib.Path("gsplat/cuda/include/Cameras.cuh").read_text(encoding="utf-8"):
+              print("::error::std::isfinite still present in Cameras.cuh")
+              ok = False
+          sys.exit(0 if ok else 1)
         shell: python
 
       - name: Label the version (1.6.0+pt210cu128)
