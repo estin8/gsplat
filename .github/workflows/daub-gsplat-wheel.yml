@@ -44,6 +44,9 @@ jobs:
       # and 16 GB; 3 x 3 = 9 at once ran out of memory on the biggest files.
       MAX_JOBS: "2"
       NVCC_APPEND_FLAGS: "--threads 2"
+      # Skip gsplat's experimental "inference renderer" add-on: Daub never uses it, and its code doesn't
+      # compile with Windows' compiler (it relies on Linux's "uint" type). The main gsplat library is unaffected.
+      BUILD_EXPERIMENTAL: "0"
 
     steps:
       - name: Add overflow memory (pagefile) so big files can't run out of memory
