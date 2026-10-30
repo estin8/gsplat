@@ -171,16 +171,24 @@ jobs:
           fi
         shell: bash
 
-      - name: Check it installs and imports
-        run: |
-          pip install dist/*.whl
-          python -c "import gsplat; print('gsplat', gsplat.__version__)"
-          cd dist && certutil -hashfile *.whl SHA256
-        shell: bash
-
       - name: Save the wheel
+        # Saved BEFORE the checks below, so a hiccup in a check can never throw away hours of compiling.
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.quick && 'quick-check-only-not-for-release' || 'daub-gsplat-wheel' }}
           path: dist/*.whl
           retention-days: 30
+
+      - name: Check it installs and its compiled library loads
+        # "from gsplat import csrc" loads the compiled GPU code itself (no GPU needed just to load it).
+        # If this failed on a buyer's PC, gsplat would try to compile itself there, which needs tools
+        # buyers don't have - so this is the check that matters.
+        run: |
+          pip install dist/*.whl
+          WHEEL_DIR="$PWD/dist"
+          # Run from outside the source folder, so Python imports the INSTALLED wheel, not the uncompiled source.
+          cd "$RUNNER_TEMP"
+          python -c "import torch, gsplat; from gsplat import csrc; print('gsplat', gsplat.__version__, '- compiled library loads:', csrc.__file__)"
+          python -c "from gsplat import rasterization; from gsplat.strategy import MCMCStrategy; print('Daub API imports ok')"
+          cd "$WHEEL_DIR" && certutil -hashfile *.whl SHA256
+        shell: bash
